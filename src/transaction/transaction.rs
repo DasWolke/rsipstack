@@ -260,6 +260,8 @@ impl Transaction {
         self.original
             .headers_mut()
             .unique_push(content_length_header);
+        log::info!("Transaction send: method={}, destination={:?}", 
+                   self.original.method, self.destination);
         connection
             .send(self.original.to_owned().into(), self.destination.as_ref())
             .await?;
