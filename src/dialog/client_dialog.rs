@@ -4,8 +4,9 @@ use crate::dialog::{authenticate::handle_client_authenticate, dialog::DialogStat
 use crate::rsip_ext::RsipResponseExt;
 use crate::transaction::transaction::Transaction;
 use crate::Result;
-use rsip::prelude::HeadersExt;
-use rsip::{Response, SipMessage, StatusCode};
+use rsip::prelude::{HeadersExt, UntypedHeader};
+use rsip::{Response, SipMessage, StatusCode, Header};
+use rsip::headers::Route;
 use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, trace};
@@ -103,6 +104,63 @@ impl ClientInviteDialog {
     /// cancel ongoing operations for this dialog.
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.inner.cancel_token
+    }
+
+    /// Set the public address for future Via headers
+    ///
+    /// Sets the discovered public address to be used in Via headers for
+    /// subsequent requests from this dialog (e.g., INVITE, BYE, re-INVITE).
+    /// This ensures proper NAT traversal for the initial INVITE and all
+    /// subsequent in-dialog requests.
+    ///
+    /// # Parameters
+    ///
+    /// * `addr` - The public SIP address to use
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use rsipstack::dialog::client_dialog::ClientInviteDialog;
+    /// # use rsipstack::transport::SipAddr;
+    /// # fn example() -> rsipstack::Result<()> {
+    /// # let dialog: ClientInviteDialog = todo!();
+    /// let public_addr = SipAddr {
+    ///     r#type: Some(rsip::Transport::Udp),
+    ///     addr: rsip::HostWithPort {
+    ///         host: "203.0.113.1".parse::<std::net::IpAddr>().unwrap().into(),
+    ///         port: Some(5060.into()),
+    ///     },
+    /// };
+    /// dialog.set_public_address(public_addr);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_public_address(&self, addr: crate::transport::SipAddr) {
+        self.inner.set_public_address(addr);
+    }
+    
+    /// Update route set from 200 OK response (UAC behavior)
+    /// 
+    /// According to RFC 3261 section 12.1.1, the UAC builds the route set
+    /// from Record-Route headers in the 200 OK response, in reverse order.
+    fn update_route_set_from_response(&self, resp: &Response) {
+        let mut route_set = vec![];
+        for h in resp.headers.iter() {
+            if let Header::RecordRoute(rr) = h {
+                route_set.push(Route::from(rr.value()));
+            }
+        }
+        
+        // UAC MUST reverse the order of Record-Route headers from 200 OK
+        route_set.reverse();
+        
+        info!("UAC updating route set from 200 OK response with {} routes (reversed)", route_set.len());
+        for (i, route) in route_set.iter().enumerate() {
+            info!("Route {}: {}", i, route);
+        }
+        
+        // Update the dialog's route set
+        *self.inner.route_set.lock().unwrap() = route_set;
     }
 
     /// Send a BYE request to terminate the dialog
@@ -496,6 +554,12 @@ impl ClientInviteDialog {
                             ));
                         }
                     };
+
+                    // For 2xx responses, update route set BEFORE creating ACK
+                    if resp.status_code == StatusCode::OK {
+                        // For UAC, build route set from Record-Route headers in 200 OK response
+                        self.update_route_set_from_response(&resp);
+                    }
 
                     let ack = self.inner.make_request(
                         rsip::Method::Ack,
