@@ -307,8 +307,27 @@ impl EndpointInner {
         };
 
         if self.incoming_sender.lock().unwrap().is_none() {
-            let resp = self.make_response(&request, rsip::StatusCode::ServiceUnavailable, None);
+            // For OPTIONS requests, respond with 200 OK instead of 503
+            let resp = if request.method == rsip::Method::Options {
+                let mut resp = self.make_response(&request, rsip::StatusCode::OK, None);
+                // Add Allow header with supported methods
+                let allowed_methods = self.allows.iter()
+                    .map(|m| m.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                resp.headers.unique_push(rsip::Header::Allow(allowed_methods.into()));
+                resp.headers.unique_push(rsip::Header::ContentLength(0.into()));
+                resp
+            } else {
+                self.make_response(&request, rsip::StatusCode::ServiceUnavailable, None)
+            };
             connection.send(resp.into(), None).await?;
+            
+            // For OPTIONS, we handled it successfully, so don't return an error
+            if request.method == rsip::Method::Options {
+                return Ok(());
+            }
+            
             return Err(Error::TransactionError(
                 "incoming_sender not set".to_string(),
                 key,
@@ -385,7 +404,7 @@ impl EndpointInner {
         addr: Option<crate::transport::SipAddr>,
         branch: Option<rsip::Param>,
     ) -> Result<rsip::typed::Via> {
-        let first_addr = match addr {
+        let mut first_addr = match addr {
             Some(addr) => addr,
             None => self
                 .transport_layer
@@ -394,6 +413,23 @@ impl EndpointInner {
                 .ok_or(Error::EndpointError("not sipaddrs".to_string()))
                 .cloned()?,
         };
+
+        // If the address is 0.0.0.0, try to get the actual local IP
+        if first_addr.addr.host == rsip::Host::IpAddr(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))) {
+            if let Ok(interfaces) = get_if_addrs::get_if_addrs() {
+                if let Some(ip) = interfaces
+                    .iter()
+                    .find(|i| !i.is_loopback() && matches!(i.addr, get_if_addrs::IfAddr::V4(_)))
+                    .and_then(|i| match &i.addr {
+                        get_if_addrs::IfAddr::V4(addr) => Some(std::net::IpAddr::V4(addr.ip)),
+                        _ => None,
+                    })
+                {
+                    first_addr.addr.host = ip.into();
+                    debug!("Replaced 0.0.0.0 with actual local IP {} in Via header", ip);
+                }
+            }
+        }
 
         let via = rsip::typed::Via {
             version: rsip::Version::V2,
