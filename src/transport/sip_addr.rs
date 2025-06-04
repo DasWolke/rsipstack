@@ -99,7 +99,7 @@ impl SipAddr {
     pub fn get_socketaddr(&self) -> Result<SocketAddr> {
         match &self.addr.host {
             host_with_port::Host::Domain(domain) => Err(crate::Error::Error(format!(
-                "Cannot convert domain {} to SocketAddr",
+                "Cannot convert domain {} to SocketAddr (DNS resolution required)",
                 domain
             ))),
             host_with_port::Host::IpAddr(ip_addr) => {
@@ -107,6 +107,11 @@ impl SipAddr {
                 Ok(SocketAddr::new(ip_addr.to_owned(), port))
             }
         }
+    }
+    
+    /// Check if this SipAddr contains a domain name that requires DNS resolution
+    pub fn needs_dns_resolution(&self) -> bool {
+        matches!(&self.addr.host, host_with_port::Host::Domain(_))
     }
 }
 impl From<SocketAddr> for SipAddr {
