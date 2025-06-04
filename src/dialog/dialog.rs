@@ -5,7 +5,6 @@ use super::{
     DialogId,
 };
 use crate::{
-    header_pop,
     rsip_ext::extract_uri_from_contact,
     transaction::{
         endpoint::EndpointInnerRef,
@@ -159,11 +158,12 @@ pub struct DialogInner {
     pub to: Mutex<String>,
 
     pub credential: Option<Credential>,
-    pub route_set: Vec<Route>,
+    pub route_set: Mutex<Vec<Route>>,
     pub(super) endpoint_inner: EndpointInnerRef,
     pub(super) state_sender: DialogStateSender,
     pub(super) tu_sender: TuSenderRef,
     pub(super) initial_request: Request,
+    pub(super) public_address: Mutex<Option<crate::transport::SipAddr>>,
 }
 
 pub type DialogStateReceiver = UnboundedReceiver<DialogState>;
@@ -188,8 +188,21 @@ impl DialogInner {
         credential: Option<Credential>,
         local_contact: Option<rsip::Uri>,
     ) -> Result<Self> {
-        let mut initial_request = initial_request;
-        let cseq = initial_request.cseq_header()?.seq()?;
+        let initial_cseq = initial_request.cseq_header()?.seq()?;
+        
+        // Determine local and remote CSeq based on role
+        let (local_cseq, remote_cseq) = match role {
+            TransactionRole::Client => {
+                // Client dialog: we sent the initial request, so both use our CSeq
+                (initial_cseq, initial_cseq)
+            }
+            TransactionRole::Server => {
+                // Server dialog: they sent the initial request
+                // local_seq is for our requests (BYE, etc.) - use random
+                // remote_seq is for their requests - use theirs
+                (crate::transaction::generate_random_cseq(), initial_cseq)
+            }
+        };
 
         let remote_uri = match role {
             TransactionRole::Client => initial_request.uri.clone(),
@@ -210,15 +223,25 @@ impl DialogInner {
         };
 
         let mut route_set = vec![];
-        for h in initial_request.headers.iter() {
-            if let Header::RecordRoute(rr) = h {
-                route_set.push(Route::from(rr.value()));
-            }
-        }
         
-        // For UAS (server), route set must be reversed (RFC 3261 section 12.1.1)
+        // Only build route set from initial request for UAS (server)
+        // UAC (client) will build route set from 200 OK response later
         if role == TransactionRole::Server {
-            route_set.reverse();
+            for h in initial_request.headers.iter() {
+                if let Header::RecordRoute(rr) = h {
+                    route_set.push(Route::from(rr.value()));
+                }
+            }
+            // Do NOT reverse for UAS - we want the same order as Record-Route headers
+            // route_set.reverse();
+            
+            // Debug: Log the route set
+            log::info!("UAS Dialog {} created with {} routes from initial request", id, route_set.len());
+            for (i, route) in route_set.iter().enumerate() {
+                log::info!("Route {}: {}", i, route);
+            }
+        } else {
+            log::info!("UAC Dialog {} created with empty route set (will be populated from 200 OK)", id);
         }
         Ok(Self {
             role,
@@ -226,17 +249,18 @@ impl DialogInner {
             id: Mutex::new(id.clone()),
             from,
             to: Mutex::new(to),
-            local_seq: AtomicU32::new(cseq),
+            local_seq: AtomicU32::new(local_cseq),
             remote_uri,
-            remote_seq: AtomicU32::new(cseq),
+            remote_seq: AtomicU32::new(remote_cseq),
             credential,
-            route_set,
+            route_set: Mutex::new(route_set),
             endpoint_inner,
             state_sender,
             tu_sender: Mutex::new(None),
             state: Mutex::new(DialogState::Calling(id)),
             initial_request,
             local_contact,
+            public_address: Mutex::new(None),
         })
     }
 
@@ -251,7 +275,7 @@ impl DialogInner {
         self.local_seq.load(Ordering::Relaxed)
     }
 
-    pub fn increment_remove_seq(&self) -> u32 {
+    pub fn increment_remote_seq(&self) -> u32 {
         self.remote_seq.fetch_add(1, Ordering::Relaxed);
         self.remote_seq.load(Ordering::Relaxed)
     }
@@ -262,6 +286,11 @@ impl DialogInner {
         *self.to.lock().unwrap() = to.typed()?.with_tag(tag.to_string().into()).to_string();
         info!("updating remote tag to: {}", self.to.lock().unwrap());
         Ok(())
+    }
+
+    pub fn set_public_address(&self, addr: crate::transport::SipAddr) {
+        info!("Dialog public address set to: {}", addr);
+        *self.public_address.lock().unwrap() = Some(addr);
     }
 
     pub(super) fn make_request(
@@ -275,11 +304,13 @@ impl DialogInner {
     ) -> Result<rsip::Request> {
         let mut headers = headers.unwrap_or_default();
         let cseq_header = CSeq {
-            seq: cseq.unwrap_or_else(|| self.increment_remove_seq()),
+            seq: cseq.unwrap_or_else(|| self.increment_local_seq()),
             method,
         };
 
-        let via = self.endpoint_inner.get_via(addr, branch)?;
+        // Use the stored public address if available and addr is not provided
+        let via_addr = addr.or_else(|| self.public_address.lock().unwrap().clone());
+        let via = self.endpoint_inner.get_via(via_addr, branch)?;
         headers.push(via.into());
         headers.push(Header::CallId(
             self.id.lock().unwrap().call_id.clone().into(),
@@ -295,7 +326,11 @@ impl DialogInner {
             .as_ref()
             .map(|c| headers.push(Contact::from(c.clone()).into()));
 
-        for route in &self.route_set {
+        // Debug: Log route set being added to request
+        let route_set = self.route_set.lock().unwrap();
+        log::info!("make_request {}: Adding {} routes from route_set", method, route_set.len());
+        for (i, route) in route_set.iter().enumerate() {
+            log::info!("Adding Route {}: {}", i, route);
             headers.push(Header::Route(route.clone()));
         }
         headers.push(Header::MaxForwards(70.into()));
@@ -388,24 +423,63 @@ impl DialogInner {
         }
     }
 
-    pub(super) async fn do_request(&self, mut request: Request) -> Result<Option<rsip::Response>> {
+    pub(super) async fn do_request(&self, request: Request) -> Result<Option<rsip::Response>> {
         let method = request.method().to_owned();
-        let destination = request
-            .route_header()
-            .map(|r| {
-                r.typed()
-                    .ok()
-                    .map(|r| r.uris().first().map(|u| u.uri.clone()))
-                    .flatten()
-            })
-            .flatten();
-
-        header_pop!(request.headers, Header::Route);
+        
+        // Debug: Log route headers
+        let route_count = request.headers.iter().filter(|h| matches!(h, Header::Route(_))).count();
+        log::info!("do_request {}: Request has {} Route headers", method, route_count);
+        
+        // For requests with Route headers, we need to implement loose routing (RFC 3261 16.12)
+        // The request is sent to the first Route URI, not the Request-URI
+        let route_header = request.route_header();
+        let (connection, destination) = if let Some(route) = route_header {
+            match route.typed() {
+                Ok(typed_route) => {
+                    if let Some(first_uri) = typed_route.uris().first() {
+                        log::info!("do_request {}: Sending to first Route: {}", method, first_uri.uri);
+                        
+                        // Clean the URI for routing (remove lr, did, etc. parameters)
+                        let mut route_uri = first_uri.uri.clone();
+                        route_uri.params.retain(|p| matches!(p, rsip::Param::Transport(_)));
+                        
+                        // Lookup connection to the first Route URI
+                        match self.endpoint_inner.transport_layer.lookup(&route_uri, self.endpoint_inner.transport_tx.clone()).await {
+                            Ok((conn, resolved_addr)) => {
+                                log::info!("do_request {}: Using route destination: {}", method, resolved_addr);
+                                (Some(conn), Some(resolved_addr))
+                            }
+                            Err(e) => {
+                                log::error!("do_request {}: Failed to lookup route: {}", method, e);
+                                (None, None)
+                            }
+                        }
+                    } else {
+                        log::warn!("do_request {}: Route header has no URIs", method);
+                        (None, None)
+                    }
+                }
+                Err(e) => {
+                    log::error!("do_request {}: Failed to parse route header: {}", method, e);
+                    (None, None)
+                }
+            }
+        } else {
+            // No Route headers - send directly to Request-URI
+            log::info!("do_request {}: No Route headers, sending to Request-URI: {}", method, request.uri);
+            (None, None)
+        };
 
         let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
-        let mut tx = Transaction::new_client(key, request, self.endpoint_inner.clone(), None);
-        tx.destination = destination.as_ref().map(|d| d.try_into().ok()).flatten();
-
+        let mut tx = Transaction::new_client(key, request, self.endpoint_inner.clone(), connection);
+        
+        // CRITICAL: Set the destination for the transaction
+        // This is essential for UDP where the connection doesn't store the destination
+        if let Some(dest) = destination {
+            tx.destination = Some(dest);
+            log::info!("do_request {}: Transaction destination set to: {}", method, tx.destination.as_ref().unwrap());
+        }
+        
         tx.send().await?;
         let mut auth_sent = false;
 

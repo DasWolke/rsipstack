@@ -138,7 +138,7 @@ impl DialogLayer {
         Self {
             endpoint,
             inner: Arc::new(DialogLayerInner {
-                last_seq: AtomicU32::new(0),
+                last_seq: AtomicU32::new(crate::transaction::generate_random_cseq()),
                 dialogs: RwLock::new(HashMap::new()),
             }),
         }

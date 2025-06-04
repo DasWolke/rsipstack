@@ -19,6 +19,14 @@ pub const TO_TAG_LEN: usize = 8;
 pub const BRANCH_LEN: usize = 12;
 pub const CNONCE_LEN: usize = 8;
 
+/// Generate a random CSeq value according to RFC 3261
+/// CSeq values MUST be expressible as a 32-bit unsigned integer
+/// and MUST be less than 2**31
+pub fn generate_random_cseq() -> u32 {
+    // Generate a value between 1 and 2^31 - 1
+    rand::random::<u32>() % 0x7FFFFFFE + 1
+}
+
 pub struct IncomingRequest {
     pub request: rsip::Request,
     pub connection: SipConnection,

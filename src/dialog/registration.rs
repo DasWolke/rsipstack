@@ -159,7 +159,7 @@ impl Registration {
     /// ```
     pub fn new(endpoint: EndpointInnerRef, credential: Option<Credential>) -> Self {
         Self {
-            last_seq: 0,
+            last_seq: crate::transaction::generate_random_cseq(),
             endpoint,
             credential,
             contact: None,
@@ -386,8 +386,18 @@ impl Registration {
         .with_tag(make_tag());
 
         let first_addr = {
-            let mut addr =
-                SipAddr::from(HostWithPort::from(Self::get_first_non_loopback_interface()?));
+            // If we have a discovered public address, use it for Via header
+            let host_with_port = if let Some((public_ip, public_port)) = self.public_address {
+                info!("Using public address for Via header: {}:{}", public_ip, public_port);
+                HostWithPort {
+                    host: public_ip.into(),
+                    port: Some(public_port.into()),
+                }
+            } else {
+                HostWithPort::from(Self::get_first_non_loopback_interface()?)
+            };
+            
+            let mut addr = SipAddr::from(host_with_port);
             let context = rsip_dns::Context::initialize_from(
                 recipient.clone(),
                 rsip_dns::AsyncTrustDnsClient::new(
@@ -435,7 +445,7 @@ impl Registration {
                         params: vec![],
                         headers: vec![],
                     },
-                    params: vec![],
+                    params: vec![Param::Other("ob".into(), None)], // Add outbound parameter for NAT
                 }
             });
         let via = self.endpoint.get_via(Some(first_addr.clone()), None)?;
@@ -527,8 +537,41 @@ impl Registration {
                         if let Some(cred) = &self.credential {
                             self.last_seq += 1;
                             
-                            // Handle authentication with the existing transaction
-                            // The contact will be updated in the next registration cycle if needed
+                            // If we discovered a new public address, update the Contact header
+                            // in the original request before authentication
+                            if let Some((public_ip, public_port)) = self.public_address {
+                                info!("Updating Contact header with public address before authentication");
+                                
+                                // Create new contact with public address
+                                let auth = if let Some(cred) = &self.credential {
+                                    Some(rsip::Auth {
+                                        user: cred.username.clone(),
+                                        password: None,
+                                    })
+                                } else {
+                                    None
+                                };
+                                
+                                let new_contact = rsip::typed::Contact {
+                                    display_name: None,
+                                    uri: rsip::Uri {
+                                        auth,
+                                        scheme: Some(rsip::Scheme::Sip),
+                                        host_with_port: HostWithPort {
+                                            host: public_ip.into(),
+                                            port: Some(public_port.into()),
+                                        },
+                                        params: vec![],
+                                        headers: vec![],
+                                    },
+                                    params: vec![Param::Other("ob".into(), None)], // Add outbound parameter
+                                };
+                                
+                                // Update the Contact header in the transaction's original request
+                                tx.original.headers.unique_push(new_contact.into());
+                            }
+                            
+                            // Handle authentication with the updated request
                             tx = handle_client_authenticate(self.last_seq, tx, resp, cred).await?;
                             
                             tx.send().await?;
@@ -541,7 +584,7 @@ impl Registration {
                     }
                     StatusCode::OK => {
                         // Check if server indicated our public IP in Via header
-                        let mut need_reregistration = false;
+                        let mut _need_reregistration = false;
                         // Get all Via headers and check each one
                         let via_headers = resp.headers.iter()
                             .filter_map(|h| match h {
@@ -592,20 +635,14 @@ impl Registration {
                                         self.contact = None;
                                         
                                         // We need to re-register immediately with the public IP
-                                        need_reregistration = true;
+                                        _need_reregistration = true;
                                         info!("Will re-register with public address");
                                     }
                                 }
                             }
                         }
                         
-                        // If we detected public IP on first registration, return success
-                        // The client will use the discovered public address for future requests
-                        if need_reregistration {
-                            info!("Discovered public IP, will use for future registrations and calls");
-                            // Don't re-register immediately - let the client handle this
-                            // and use the discovered public address for INVITE requests
-                        }
+                        // The public address has been discovered and will be used for future requests
                         
                         info!("registration do_request done: {:?}", resp.status_code);
                         return Ok(resp);
@@ -669,13 +706,13 @@ impl Registration {
             local_address.clone().into()
         };
 
-        let params = vec![];
-        
-        // Don't add 'ob' parameter as it may confuse some SIP proxies
-        // and prevent proper ACK routing
-        // if public_address.is_some() {
-        //     params.push(Param::Other("ob".into(), None));
-        // }
+        // Add 'ob' (outbound) parameter to indicate NAT awareness
+        // This matches PJSIP behavior for proper NAT traversal
+        let params = if public_address.is_some() {
+            vec![Param::Other("ob".into(), None)]
+        } else {
+            vec![]
+        };
 
         rsip::typed::Contact {
             display_name: None,
