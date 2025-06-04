@@ -4,7 +4,7 @@
 
 use crate::dialog::{
     client_dialog::ClientInviteDialog,
-    dialog::{DialogInner, DialogState},
+    dialog::{DialogInner, DialogState, TerminatedReason},
     DialogId,
 };
 use crate::transaction::{endpoint::EndpointBuilder, key::TransactionRole};
@@ -218,13 +218,13 @@ async fn test_client_dialog_termination_scenarios() -> crate::Result<()> {
     // Terminate early with error
     client_dialog_1.inner.transition(DialogState::Terminated(
         dialog_id_1.clone(),
-        Some(StatusCode::BusyHere),
+        TerminatedReason::UasBusy,
     ))?;
 
     let state = client_dialog_1.inner.state.lock().unwrap().clone();
     assert!(matches!(
         state,
-        DialogState::Terminated(_, Some(StatusCode::BusyHere))
+        DialogState::Terminated(_, TerminatedReason::UasBusy)
     ));
 
     // Test 2: Normal termination after confirmed
@@ -256,11 +256,15 @@ async fn test_client_dialog_termination_scenarios() -> crate::Result<()> {
     assert!(client_dialog_2.inner.is_confirmed());
 
     // Then terminate normally
-    client_dialog_2
-        .inner
-        .transition(DialogState::Terminated(dialog_id_2.clone(), None))?;
+    client_dialog_2.inner.transition(DialogState::Terminated(
+        dialog_id_2.clone(),
+        TerminatedReason::UacBye,
+    ))?;
     let state = client_dialog_2.inner.state.lock().unwrap().clone();
-    assert!(matches!(state, DialogState::Terminated(_, None)));
+    assert!(matches!(
+        state,
+        DialogState::Terminated(_, TerminatedReason::UacBye)
+    ));
 
     Ok(())
 }

@@ -22,6 +22,9 @@ use tracing::{error, info};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// SIP address
+    #[arg(long)]
+    addr: Option<String>,
     /// SIP port
     #[arg(long, default_value = "25060")]
     port: u16,
@@ -66,16 +69,17 @@ async fn main() -> Result<()> {
     } else {
         Some(format!("{}:{}", external_ip, args.port).parse()?)
     };
-
-    let addr = get_if_addrs()?
-        .iter()
-        .find(|i| !i.is_loopback())
-        .map(|i| match i.addr {
-            get_if_addrs::IfAddr::V4(ref addr) => Ok(std::net::IpAddr::V4(addr.ip)),
-            _ => Err(Error::Error("No IPv4 address found".to_string())),
-        })
-        .unwrap_or(Err(Error::Error("No interface found".to_string())))?;
-
+    let addr = match args.addr {
+        Some(addr) => addr.parse::<std::net::IpAddr>()?,
+        None => get_if_addrs()?
+            .iter()
+            .find(|i| !i.is_loopback())
+            .map(|i| match i.addr {
+                get_if_addrs::IfAddr::V4(ref addr) => Ok(std::net::IpAddr::V4(addr.ip)),
+                _ => Err(Error::Error("No IPv4 address found".to_string())),
+            })
+            .unwrap_or(Err(Error::Error("No interface found".to_string())))?,
+    };
     let connection = UdpConnection::create_connection(
         format!("{}:{}", addr, args.port).parse()?,
         external.clone(),

@@ -328,8 +328,8 @@ async fn process_dialog(
             DialogState::Early(id, resp) => {
                 info!("Early dialog {} {}", id, resp);
             }
-            DialogState::Terminated(id, status_code) => {
-                info!("Dialog terminated {} {:?}", id, status_code);
+            DialogState::Terminated(id, reason) => {
+                info!("Dialog terminated {} {:?}", id, reason);
                 dialog_layer.remove_dialog(&id);
             }
             _ => {

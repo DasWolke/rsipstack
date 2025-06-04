@@ -6,7 +6,10 @@ use super::{
     SipConnection, TransactionReceiver, TransactionSender, TransactionTimer,
 };
 use crate::{
-    transport::{SipAddr, TransportEvent, TransportLayer},
+    transport::{
+        connection::{TransportReceiver, TransportSender},
+        SipAddr, TransportEvent, TransportLayer,
+    },
     Error, Result, USER_AGENT,
 };
 use rsip::SipMessage;
@@ -15,7 +18,6 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::{
     select,
     sync::mpsc::{error, unbounded_channel},
@@ -68,8 +70,9 @@ pub struct EndpointInner {
     incoming_sender: Mutex<Option<TransactionSender>>,
     cancel_token: CancellationToken,
     timer_interval: Duration,
-    pub transport_tx: UnboundedSender<TransportEvent>,
-    transport_rx: Mutex<UnboundedReceiver<TransportEvent>>,
+
+    pub(crate) transport_tx: TransportSender,
+    pub(crate) transport_rx: Mutex<Option<TransportReceiver>>,
 
     pub t1: Duration,
     pub t4: Duration,
@@ -176,7 +179,7 @@ impl EndpointInner {
             finished_transactions: Mutex::new(HashMap::new()),
             timer_interval: timer_interval.unwrap_or(Duration::from_millis(20)),
             transport_tx,
-            transport_rx: Mutex::new(transport_rx),
+            transport_rx: Mutex::new(Some(transport_rx)),
             cancel_token,
             incoming_sender: Mutex::new(None),
             t1: Duration::from_millis(500),
@@ -204,7 +207,13 @@ impl EndpointInner {
         let transport_tx = self.transport_tx.clone();
         self.transport_layer.serve_listens(transport_tx).await.ok();
 
-        let mut transport_rx = self.transport_rx.lock().unwrap();
+        let mut transport_rx = match self.transport_rx.lock().unwrap().take() {
+            Some(rx) => rx,
+            None => {
+                return Err(Error::EndpointError("transport_rx not set".to_string()));
+            }
+        };
+
         while let Some(event) = transport_rx.recv().await {
             match event {
                 TransportEvent::Incoming(msg, connection, from) => {

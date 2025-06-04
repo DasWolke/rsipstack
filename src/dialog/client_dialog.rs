@@ -1,6 +1,9 @@
 use super::dialog::DialogInnerRef;
 use super::DialogId;
-use crate::dialog::{authenticate::handle_client_authenticate, dialog::DialogState};
+use crate::dialog::{
+    authenticate::handle_client_authenticate,
+    dialog::{DialogState, TerminatedReason},
+};
 use crate::rsip_ext::RsipResponseExt;
 use crate::transaction::transaction::Transaction;
 use crate::Result;
@@ -9,7 +12,7 @@ use rsip::{Response, SipMessage, StatusCode, Header};
 use rsip::headers::Route;
 use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 /// Client-side INVITE Dialog (UAC)
 ///
@@ -193,15 +196,14 @@ impl ClientInviteDialog {
             .inner
             .make_request(rsip::Method::Bye, None, None, None, None, None)?;
 
-        let status_code = match self.inner.do_request(request).await {
-            Ok(resp) => resp.map(|r| r.status_code),
+        match self.inner.do_request(request).await {
+            Ok(_) => {}
             Err(e) => {
                 info!("bye error: {}", e);
-                None
             }
         };
         self.inner
-            .transition(DialogState::Terminated(self.id(), status_code))?;
+            .transition(DialogState::Terminated(self.id(), TerminatedReason::UacBye))?;
         Ok(())
     }
 
@@ -409,17 +411,17 @@ impl ClientInviteDialog {
         );
 
         let cseq = tx.original.cseq_header()?.seq()?;
-        if cseq < self.inner.remote_seq.load(Ordering::Relaxed) {
-            info!(
-                "received old request remote_seq: {} > {}",
-                self.inner.remote_seq.load(Ordering::Relaxed),
-                cseq
-            );
+        let remote_seq = self.inner.remote_seq.load(Ordering::Relaxed);
+        if remote_seq > 0 && cseq < remote_seq {
+            info!("received old request remote_seq: {} > {}", remote_seq, cseq);
             tx.reply(rsip::StatusCode::ServerInternalError).await?;
             return Ok(());
         }
 
-        self.inner.remote_seq.store(cseq, Ordering::Relaxed);
+        self.inner
+            .remote_seq
+            .compare_exchange(remote_seq, cseq, Ordering::Relaxed, Ordering::Relaxed)
+            .ok();
 
         if self.inner.is_confirmed() {
             match tx.original.method {
@@ -449,7 +451,7 @@ impl ClientInviteDialog {
     async fn handle_bye(&mut self, mut tx: Transaction) -> Result<()> {
         info!("received bye");
         self.inner
-            .transition(DialogState::Terminated(self.id(), None))?;
+            .transition(DialogState::Terminated(self.id(), TerminatedReason::UasBye))?;
         tx.reply(rsip::StatusCode::OK).await?;
         Ok(())
     }
@@ -506,7 +508,7 @@ impl ClientInviteDialog {
                                 info!("received {} response after auth sent", resp.status_code);
                                 self.inner.transition(DialogState::Terminated(
                                     self.id(),
-                                    Some(resp.status_code),
+                                    TerminatedReason::ProxyAuthRequired,
                                 ))?;
                                 break;
                             }
@@ -525,7 +527,7 @@ impl ClientInviteDialog {
                                 info!("received 407 response without auth option");
                                 self.inner.transition(DialogState::Terminated(
                                     self.id(),
-                                    Some(resp.status_code),
+                                    TerminatedReason::ProxyAuthRequired,
                                 ))?;
                             }
                             continue;
@@ -573,7 +575,13 @@ impl ClientInviteDialog {
                     if let Ok(id) = DialogId::try_from(&ack) {
                         dialog_id = id;
                     }
-                    tx.send_ack(ack).await?;
+                    match tx.send_ack(ack).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!("send ack error: {}", e);
+                        }
+                    }
+
                     match resp.status_code {
                         StatusCode::OK => {
                             self.inner
@@ -586,7 +594,7 @@ impl ClientInviteDialog {
                             }
                             self.inner.transition(DialogState::Terminated(
                                 self.id(),
-                                Some(resp.status_code.clone()),
+                                TerminatedReason::UasOther(Some(resp.status_code.clone())),
                             ))?;
                             return Err(crate::Error::DialogError(reason, self.id()));
                         }

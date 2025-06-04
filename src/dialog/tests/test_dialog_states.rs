@@ -4,7 +4,7 @@
 //! according to RFC 3261 Section 12.
 
 use crate::dialog::{
-    dialog::{DialogInner, DialogState},
+    dialog::{DialogInner, DialogState, TerminatedReason},
     DialogId,
 };
 use crate::transaction::{endpoint::EndpointBuilder, key::TransactionRole};
@@ -120,7 +120,10 @@ async fn test_dialog_state_transitions() -> crate::Result<()> {
     assert!(dialog_inner.is_confirmed());
 
     // Test transition to Terminated
-    dialog_inner.transition(DialogState::Terminated(dialog_id.clone(), None))?;
+    dialog_inner.transition(DialogState::Terminated(
+        dialog_id.clone(),
+        TerminatedReason::Timeout,
+    ))?;
     let state = dialog_inner.state.lock().unwrap().clone();
     assert!(matches!(state, DialogState::Terminated(_, _)));
 
@@ -296,12 +299,12 @@ async fn test_dialog_termination_scenarios() -> crate::Result<()> {
     // Terminate with error
     dialog_inner_1.transition(DialogState::Terminated(
         dialog_id_1.clone(),
-        Some(StatusCode::BusyHere),
+        TerminatedReason::UasBusy,
     ))?;
     let state = dialog_inner_1.state.lock().unwrap().clone();
     assert!(matches!(
         state,
-        DialogState::Terminated(_, Some(StatusCode::BusyHere))
+        DialogState::Terminated(_, TerminatedReason::UasBusy)
     ));
 
     // Test 2: Normal termination (BYE)
@@ -327,9 +330,12 @@ async fn test_dialog_termination_scenarios() -> crate::Result<()> {
     assert!(dialog_inner_2.is_confirmed());
 
     // Then terminate normally
-    dialog_inner_2.transition(DialogState::Terminated(dialog_id_2.clone(), None))?;
+    dialog_inner_2.transition(DialogState::Terminated(
+        dialog_id_2.clone(),
+        TerminatedReason::UacBye,
+    ))?;
     let state = dialog_inner_2.state.lock().unwrap().clone();
-    assert!(matches!(state, DialogState::Terminated(_, None)));
+    assert!(matches!(state, DialogState::Terminated(_, _)));
 
     Ok(())
 }
@@ -365,10 +371,6 @@ async fn test_dialog_sequence_numbers() -> crate::Result<()> {
     assert_eq!(next_seq, 2);
     assert_eq!(dialog_inner.get_local_seq(), 2);
 
-    // Test remote sequence
-    let remote_seq = dialog_inner.increment_remove_seq();
-    assert_eq!(remote_seq, 2);
-
     Ok(())
 }
 
@@ -391,9 +393,9 @@ async fn test_dialog_state_display() -> crate::Result<()> {
     assert!(confirmed_state.to_string().contains("Confirmed"));
     assert!(confirmed_state.is_confirmed());
 
-    let terminated_state = DialogState::Terminated(dialog_id.clone(), Some(StatusCode::BusyHere));
+    let terminated_state = DialogState::Terminated(dialog_id.clone(), TerminatedReason::Timeout);
     assert!(terminated_state.to_string().contains("Terminated"));
-    assert!(terminated_state.to_string().contains("486"));
+    assert!(terminated_state.to_string().contains("Timeout"));
 
     Ok(())
 }

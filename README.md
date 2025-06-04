@@ -41,60 +41,64 @@ We are a group of developers who are passionate about SIP and Rust. We believe t
 
 ### 1. Simple SIP Connection
 
-The most basic way to use rsipstack is through direct SIP connections:
+The most basic way to use rsipstack is through direct SIP connections, supporting both UDP and TCP transports:
 
 ```bash
+# Run as UDP server (default)
 cargo run --example simple_connection
+
+# Run as UDP client sending messages to a server
+cargo run --example simple_connection -- --mode client --target 127.0.0.1:5060  --port 5061
+
+# Run as TCP server
+cargo run --example simple_connection -- --transport tcp --mode server --port 5060
+
 ```
 
 This example demonstrates:
-- Creating UDP/TCP connections
-- Sending raw SIP messages
-- Basic message handling
+- Creating UDP/TCP connections and listeners
+- Sending raw SIP messages (OPTIONS, MESSAGE, REGISTER)
+- Handling incoming SIP requests and responses
+- Basic SIP message parsing and creation
 
-### 2. Endpoint, TransportLayer and Transaction
+### 2. SIP Proxy Server
 
-For more advanced usage with transaction handling:
-
-```bash
-cargo run --example endpoint_transaction
-```
-
-This example shows:
-- Creating and configuring an Endpoint
-- Setting up TransportLayer with multiple transports
-- Handling SIP transactions (client and server)
-- Processing various SIP methods (OPTIONS, REGISTER, MESSAGE)
-
-### 3. SIP User Agent (Register/Invite)
-
-A complete SIP user agent implementation:
+A stateful SIP proxy that routes calls between registered users:
 
 ```bash
-cargo run --example ua_register_invite
+# Run proxy server
+cargo run --example proxy -- --port 25060 --addr 127.0.0.1
+
+# Run with external IP
+cargo run --example proxy -- --port 25060 --external-ip 1.2.3.4
 ```
 
-Features:
-- User registration with SIP registrar
-- Making and receiving INVITE calls
-- Call establishment and termination
-- Dialog management
-- Authentication handling
+This example demonstrates:
+- SIP user registration and location service
+- Call routing between registered users
+- Transaction forwarding and response handling
+- Session management for active calls
+- Handling INVITE, BYE, REGISTER, and ACK methods
 
-### 4. SIP Proxy (Register/Invite)
+### 3. SIP User Agent Client
 
-A SIP proxy server implementation:
+A complete SIP client with registration, calling, and media support:
 
 ```bash
-cargo run --example proxy_register_invite
+# Local demo proxy
+cargo run --example client -- --port 25061 --sip-server 127.0.0.1:25060
+
+# Register with a SIP server
+cargo run --example client -- --sip-server sip.example.com --user alice --password secret
 ```
 
-Features:
-- SIP message routing
-- Registration handling
-- Call forwarding
-- Multiple transport support
-- Load balancing
+This example demonstrates:
+- SIP user registration with digest authentication
+- Making and receiving SIP calls (INVITE/BYE)
+- Dialog management for call sessions
+- RTP media streaming with file playback
+- STUN support for NAT traversal
+
 
 ## API Usage Guide
 
@@ -107,20 +111,22 @@ use rsipstack::transport::{udp::UdpConnection, SipAddr};
 let connection = UdpConnection::create_connection("127.0.0.1:5060".parse()?, None).await?;
 
 // Send raw SIP message
-let sip_message = "MESSAGE sip:test@example.com SIP/2.0\r\n...";
+let sip_message = "OPTIONS sip:test@example.com SIP/2.0\r\n...";
 connection.send_raw(sip_message.as_bytes(), &target_addr).await?;
 ```
 
 ### 2. Using Endpoint and Transactions
 
 ```rust
-use rsipstack::{EndpointBuilder, transaction::TransactionType};
-use rsipstack::transport::TransportLayer;
+use rsipstack::{EndpointBuilder, transport::TransportLayer};
+use tokio_util::sync::CancellationToken;
 
-// Build endpoint
-let transport_layer = TransportLayer::new(cancel_token);
+// Build endpoint with transport layer
+let cancel_token = CancellationToken::new();
+let transport_layer = TransportLayer::new(cancel_token.clone());
 let endpoint = EndpointBuilder::new()
     .with_transport_layer(transport_layer)
+    .with_cancel_token(cancel_token)
     .build();
 
 // Handle incoming transactions
@@ -129,52 +135,82 @@ while let Some(transaction) = incoming.recv().await {
     // Process transaction based on method
     match transaction.original.method {
         rsip::Method::Register => {
-            transaction.respond(rsip::StatusCode::OK, None, None).await?;
+            transaction.reply(rsip::StatusCode::OK).await?;
+        }
+        rsip::Method::Options => {
+            transaction.reply(rsip::StatusCode::OK).await?;
         }
         // ... handle other methods
     }
 }
 ```
 
-### 3. Creating a User Agent
+### 3. Creating a User Agent Client
 
 ```rust
-use rsipstack::dialog::{DialogLayer, InviteDialog};
+use rsipstack::dialog::{DialogLayer, registration::Registration};
+use rsipstack::dialog::authenticate::Credential;
 
 // Create dialog layer
-let dialog_layer = DialogLayer::new(endpoint);
+let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
 
 // Register with server
-let register_dialog = dialog_layer.create_register_dialog(
-    "sip:alice@example.com",
-    "sip:registrar.example.com"
-).await?;
+let credential = Credential {
+    username: "alice".to_string(),
+    password: "secret".to_string(),
+    realm: None,
+};
+
+let registration = Registration::new(
+    endpoint.inner.clone(),
+    "sip:alice@example.com".parse()?,
+    "sip:registrar.example.com".parse()?,
+    credential,
+)?;
 
 // Make outgoing call
-let invite_dialog = dialog_layer.create_invite_dialog(
-    "sip:alice@example.com",
-    "sip:bob@example.com"
-).await?;
+let invite_option = InviteOption {
+    callee: "sip:bob@example.com".parse()?,
+    caller: "sip:alice@example.com".parse()?,
+    content_type: None,
+    offer: None,
+    contact: "sip:alice@192.168.1.100:5060".parse()?,
+    credential: Some(credential),
+    headers: None,
+};
+
+let invite_dialog = dialog_layer.create_invite_dialog(invite_option).await?;
 ```
 
 ### 4. Implementing a Proxy
 
 ```rust
-use rsipstack::transaction::Endpoint;
-
-// Create proxy endpoint
-let proxy = EndpointBuilder::new()
-    .with_transport_layer(transport_layer)
-    .build();
+use rsipstack::transaction::Transaction;
+use std::collections::HashMap;
 
 // Handle incoming requests
-let mut incoming = proxy.incoming_transactions();
-while let Some(transaction) = incoming.recv().await {
-    // Route request based on URI
-    let target = route_request(&transaction.original)?;
-    
-    // Forward request
-    proxy.forward_request(transaction, target).await?;
+while let Some(mut transaction) = incoming.recv().await {
+    match transaction.original.method {
+        rsip::Method::Register => {
+            // Store user registration
+            let user = User::try_from(&transaction.original)?;
+            users.insert(user.username.clone(), user);
+            transaction.reply(rsip::StatusCode::OK).await?;
+        }
+        rsip::Method::Invite => {
+            // Route call to registered user
+            let callee = extract_callee(&transaction.original)?;
+            if let Some(target) = users.get(&callee) {
+                // Forward request
+                let mut forwarded_tx = transaction.create_client_transaction()?;
+                forwarded_tx.destination = Some(target.destination.clone());
+                forwarded_tx.send().await?;
+            } else {
+                transaction.reply(rsip::StatusCode::NotFound).await?;
+            }
+        }
+        // ... handle other methods
+    }
 }
 ```
 
@@ -185,22 +221,6 @@ while let Some(transaction) = incoming.recv().await {
 cargo test
 ```
 
-### RFC 3261 Compliance Tests
-```bash
-# Run all compliance tests
-cargo test rfc3261_compliance
-
-# Run specific compliance test suites
-cargo test rfc3261_transactions
-cargo test rfc3261_dialogs
-cargo test rfc3261_transport
-```
-
-### Integration Tests
-```bash
-# Test with real SIP scenarios
-cargo test --test integration_tests
-```
 
 ### Benchmark Tests
 ```bash
@@ -228,7 +248,6 @@ Calls/Second: 1501
 
 - [API Documentation](https://docs.rs/rsipstack)
 - [Examples](./examples/)
-- [RFC 3261 Compliance Tests](./tests/)
 
 ## Contributing
 

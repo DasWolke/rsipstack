@@ -1,10 +1,10 @@
-use super::dialog::{Dialog, DialogInnerRef};
+use super::dialog::{Dialog, DialogInnerRef, DialogState, TerminatedReason};
 use super::DialogId;
-use crate::dialog::dialog::DialogState;
-use crate::transaction::transaction::{Transaction, TransactionEvent};
-use crate::Result;
-use rsip::prelude::HeadersExt;
-use rsip::{Header, Request, SipMessage, StatusCode};
+use crate::{
+    transaction::transaction::{Transaction, TransactionEvent},
+    Result,
+};
+use rsip::{prelude::HeadersExt, Header, Request, SipMessage, StatusCode};
 use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, trace, warn};
@@ -196,12 +196,15 @@ impl ServerInviteDialog {
     /// # fn example() -> rsipstack::Result<()> {
     /// # let dialog: ServerInviteDialog = todo!();
     /// # let local_addr: SipAddr = todo!();
-    /// let public_addr = Some((IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 5060));
+    /// let public_addr = Some(rsip::HostWithPort {
+    ///     host: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)).into(),
+    ///     port: Some(5060.into()),
+    /// });
     /// let answer_sdp = b"v=0\r\no=- 123 456 IN IP4 203.0.113.1\r\n...";
     /// let headers = vec![
     ///     rsip::Header::ContentType("application/sdp".into())
     /// ];
-    /// 
+    ///
     /// dialog.accept_with_public_contact(
     ///     "alice",
     ///     public_addr,
@@ -215,24 +218,21 @@ impl ServerInviteDialog {
     pub fn accept_with_public_contact(
         &self,
         username: &str,
-        public_address: Option<(std::net::IpAddr, u16)>,
+        public_address: Option<rsip::HostWithPort>,
         local_address: &crate::transport::SipAddr,
         headers: Option<Vec<Header>>,
         body: Option<Vec<u8>>,
     ) -> Result<()> {
         use super::registration::Registration;
-        
+
         // Create NAT-aware Contact header
-        let contact_header = Registration::create_nat_aware_contact(
-            username,
-            public_address,
-            local_address,
-        );
-        
+        let contact_header =
+            Registration::create_nat_aware_contact(username, public_address, local_address);
+
         // Combine provided headers with Contact header
         let mut final_headers = headers.unwrap_or_default();
         final_headers.push(contact_header.into());
-        
+
         // Use the regular accept method with the enhanced headers
         self.accept(Some(final_headers), body)
     }
@@ -338,15 +338,15 @@ impl ServerInviteDialog {
         let request = self
             .inner
             .make_request(rsip::Method::Bye, None, None, None, None, None)?;
-        let status_code = match self.inner.do_request(request).await {
-            Ok(resp) => resp.map(|r| r.status_code),
+
+        match self.inner.do_request(request).await {
+            Ok(_) => {}
             Err(e) => {
                 info!("bye error: {}", e);
-                None
             }
         };
         self.inner
-            .transition(DialogState::Terminated(self.id(), status_code))?;
+            .transition(DialogState::Terminated(self.id(), TerminatedReason::UasBye))?;
         Ok(())
     }
 
@@ -522,18 +522,22 @@ impl ServerInviteDialog {
         );
 
         let cseq = tx.original.cseq_header()?.seq()?;
-        if cseq < self.inner.remote_seq.load(Ordering::Relaxed) {
+        let remote_seq = self.inner.remote_seq.load(Ordering::Relaxed);
+        if remote_seq > 0 && cseq < remote_seq {
             info!(
                 "received old request {} remote_seq: {} > {}",
                 tx.original.method(),
-                self.inner.remote_seq.load(Ordering::Relaxed),
+                remote_seq,
                 cseq
             );
             // discard old request
             return Ok(());
         }
 
-        self.inner.remote_seq.store(cseq, Ordering::Relaxed);
+        self.inner
+            .remote_seq
+            .compare_exchange(remote_seq, cseq, Ordering::Relaxed, Ordering::Relaxed)
+            .ok();
 
         if self.inner.is_confirmed() {
             match tx.original.method {
@@ -578,7 +582,7 @@ impl ServerInviteDialog {
     async fn handle_bye(&mut self, mut tx: Transaction) -> Result<()> {
         info!("received bye {}", tx.original.uri);
         self.inner
-            .transition(DialogState::Terminated(self.id(), None))?;
+            .transition(DialogState::Terminated(self.id(), TerminatedReason::UacBye))?;
         tx.reply(rsip::StatusCode::OK).await?;
         Ok(())
     }
@@ -632,7 +636,7 @@ impl ServerInviteDialog {
                             tx.reply(rsip::StatusCode::RequestTerminated).await?;
                             self.inner.transition(DialogState::Terminated(
                                 self.id(),
-                                Some(StatusCode::RequestTerminated),
+                                TerminatedReason::UacCancel,
                             ))?;
                         }
                         _ => {}

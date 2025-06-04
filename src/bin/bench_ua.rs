@@ -1,6 +1,8 @@
 use clap::Parser;
 use futures::future::{self, Future};
-use rsipstack::dialog::dialog::{Dialog, DialogState, DialogStateReceiver, DialogStateSender};
+use rsipstack::dialog::dialog::{
+    Dialog, DialogState, DialogStateReceiver, DialogStateSender, TerminatedReason,
+};
 use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::dialog::DialogId;
@@ -284,14 +286,15 @@ async fn process_dialog_state(
             }
             DialogState::Terminated(id, status) => {
                 match status {
-                    Some(status) => {
-                        if status == rsip::StatusCode::BusyHere {
-                            stats.reject_calls.fetch_add(1, Ordering::Relaxed);
-                        } else if status != rsip::StatusCode::OK {
-                            stats.failed_calls.fetch_add(1, Ordering::Relaxed);
-                        }
+                    TerminatedReason::UacOther(Some(status)) => {
+                        info!("dialog terminated with status: {}", status);
                     }
-                    None => {}
+                    TerminatedReason::UasOther(Some(status)) => {
+                        info!("dialog terminated with status: {}", status);
+                    }
+                    TerminatedReason::UacOther(None) => {}
+                    TerminatedReason::UasOther(None) => {}
+                    _ => {}
                 }
                 dialog_layer.remove_dialog(&id);
                 // Remove from active calls tracking

@@ -1,6 +1,9 @@
-use rsip::message::HasHeaders;
+use rsip::{message::HasHeaders, prelude::HeadersExt};
+
+use crate::transport::SipConnection;
 pub trait RsipResponseExt {
     fn reason_phrase(&self) -> Option<&str>;
+    fn via_received(&self) -> Option<rsip::HostWithPort>;
 }
 
 impl RsipResponseExt for rsip::Response {
@@ -14,6 +17,14 @@ impl RsipResponseExt for rsip::Response {
             }
         }
         None
+    }
+    /// Parse the received address from the Via header
+    ///
+    /// This function extracts the received address from the Via header
+    /// and returns it as a HostWithPort struct.
+    fn via_received(&self) -> Option<rsip::HostWithPort> {
+        let via = self.via_header().ok()?;
+        SipConnection::parse_target_from_via(via).ok()
     }
 }
 
