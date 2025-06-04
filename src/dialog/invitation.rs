@@ -168,6 +168,14 @@ impl DialogLayer {
     /// # }
     /// ```
     pub fn make_invite_request(&self, opt: &InviteOption) -> Result<Request> {
+        self.make_invite_request_with_public_address(opt, None)
+    }
+
+    fn make_invite_request_with_public_address(
+        &self, 
+        opt: &InviteOption,
+        public_address: Option<(std::net::IpAddr, u16)>,
+    ) -> Result<Request> {
         let last_seq = self.increment_last_seq();
         let to = rsip::typed::To {
             display_name: None,
@@ -183,7 +191,15 @@ impl DialogLayer {
         }
         .with_tag(make_tag());
 
-        let via = self.endpoint.get_via(None, None)?;
+        // Create Via header with public address if provided
+        let via_addr = public_address.map(|(ip, port)| crate::transport::SipAddr {
+            r#type: Some(rsip::Transport::Udp),
+            addr: rsip::HostWithPort {
+                host: ip.into(),
+                port: Some(port.into()),
+            },
+        });
+        let via = self.endpoint.get_via(via_addr, None)?;
         let mut request =
             self.endpoint
                 .make_request(rsip::Method::Invite, recipient, via, form, to, last_seq);
@@ -323,7 +339,33 @@ impl DialogLayer {
         opt: InviteOption,
         state_sender: DialogStateSender,
     ) -> Result<(ClientInviteDialog, Option<Response>)> {
-        let mut request = self.make_invite_request(&opt)?;
+        self.do_invite_with_public_address(opt, state_sender, None).await
+    }
+
+    /// Send an INVITE request with public address and create a client dialog
+    ///
+    /// This is similar to `do_invite` but allows specifying a public address
+    /// to be used for Via headers in the INVITE and all subsequent in-dialog
+    /// requests. This is useful for NAT traversal when the public address has
+    /// been discovered through REGISTER or other means.
+    ///
+    /// # Parameters
+    ///
+    /// * `opt` - INVITE options containing all call parameters
+    /// * `state_sender` - Channel for receiving dialog state updates
+    /// * `public_address` - Optional public IP and port to use in Via headers
+    ///
+    /// # Returns
+    ///
+    /// * `Ok((ClientInviteDialog, Option<Response>))` - Created dialog and final response
+    /// * `Err(Error)` - Failed to send INVITE or process responses
+    pub async fn do_invite_with_public_address(
+        &self,
+        opt: InviteOption,
+        state_sender: DialogStateSender,
+        public_address: Option<(std::net::IpAddr, u16)>,
+    ) -> Result<(ClientInviteDialog, Option<Response>)> {
+        let mut request = self.make_invite_request_with_public_address(&opt, public_address)?;
         request.body = opt.offer.unwrap_or_default();
         request.headers.unique_push(rsip::Header::ContentLength(
             (request.body.len() as u32).into(),
@@ -340,13 +382,27 @@ impl DialogLayer {
             Some(opt.contact),
         )?;
 
-        let key =
-            TransactionKey::from_request(&dlg_inner.initial_request, TransactionRole::Client)?;
-        let tx = Transaction::new_client(key, request.clone(), self.endpoint.clone(), None);
-
         let dialog = ClientInviteDialog {
             inner: Arc::new(dlg_inner),
         };
+
+        // Set the public address if provided
+        if let Some((public_ip, public_port)) = public_address {
+            let public_sip_addr = crate::transport::SipAddr {
+                r#type: Some(rsip::Transport::Udp),
+                addr: rsip::HostWithPort {
+                    host: public_ip.into(),
+                    port: Some(public_port.into()),
+                },
+            };
+            dialog.set_public_address(public_sip_addr);
+            info!("UAC dialog configured with public address: {}:{}", public_ip, public_port);
+        }
+
+        let key =
+            TransactionKey::from_request(&dialog.inner.initial_request, TransactionRole::Client)?;
+        let tx = Transaction::new_client(key, request.clone(), self.endpoint.clone(), None);
+
         self.inner
             .dialogs
             .write()

@@ -237,6 +237,38 @@ impl ServerInviteDialog {
         self.accept(Some(final_headers), body)
     }
 
+    /// Set the public address for future Via headers
+    ///
+    /// Sets the discovered public address to be used in Via headers for
+    /// subsequent requests from this dialog (e.g., BYE, re-INVITE).
+    /// This ensures proper NAT traversal for in-dialog requests.
+    ///
+    /// # Parameters
+    ///
+    /// * `addr` - The public SIP address to use
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use rsipstack::dialog::server_dialog::ServerInviteDialog;
+    /// # use rsipstack::transport::SipAddr;
+    /// # fn example() -> rsipstack::Result<()> {
+    /// # let dialog: ServerInviteDialog = todo!();
+    /// let public_addr = SipAddr {
+    ///     r#type: Some(rsip::Transport::Udp),
+    ///     addr: rsip::HostWithPort {
+    ///         host: "203.0.113.1".parse::<std::net::IpAddr>().unwrap().into(),
+    ///         port: Some(5060.into()),
+    ///     },
+    /// };
+    /// dialog.set_public_address(public_addr);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_public_address(&self, addr: crate::transport::SipAddr) {
+        self.inner.set_public_address(addr);
+    }
+
     /// Reject the incoming INVITE request
     ///
     /// Sends a 603 Decline response to reject the incoming INVITE request.
